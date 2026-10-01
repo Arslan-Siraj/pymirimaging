@@ -1,3 +1,15 @@
+Metadata-Version: 2.4
+Name: pymirimaging
+Version: 0.0.1
+Summary: pyM2aia-style MIR spectral imaging with Zarr processing and NRRD interchange
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.23
+Requires-Dist: SimpleITK>=2.2
+Requires-Dist: zarr<3,>=2.16
+Provides-Extra: test
+Requires-Dist: pytest>=7; extra == "test"
+
 # pymirimaging
 
 - **Zarr is the main working / processing format.**
