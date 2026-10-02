@@ -3,9 +3,15 @@ from pathlib import Path
 import numpy as np
 import SimpleITK as sitk
 from scipy import ndimage as ndi
-from scipy.spatial import cKDTree
-from skimage import filters, measure, morphology, util
+from sklearn.neighbors import NearestNeighbors
+from skimage import filters, morphology, measure, util
 from skimage.draw import disk
+from skimage.measure import label, regionprops
+from skimage.morphology import (
+    binary_closing,
+    binary_erosion,
+    disk as morph_disk,
+)
 
 
 def _as_sitk_image(source):
@@ -24,36 +30,38 @@ def _as_sitk_image(source):
     )
 
 
-def _copy_information_and_metadata(source, target):
-    target.CopyInformation(source)
-
-    for key in source.GetMetaDataKeys():
-        try:
-            target.SetMetaData(key, source.GetMetaData(key))
-        except RuntimeError:
-            pass
-
-
 class FluorescenceSamplingMask:
     """
-    Generate a fluorescence-derived spatial sampling mask.
+    Fluorescence sampling mask reproducing the reference masking script.
 
-    This class packages the current fluorescence masking workflow:
+    The selection algorithm intentionally follows the supplied script,
+    including:
 
-    1. Gaussian smoothing for broad tissue detection.
-    2. Explicit tissue threshold.
-    3. Tissue cleanup and largest-component selection.
-    4. Tissue erosion to avoid boundary regions.
-    5. Explicit object-intensity threshold.
-    6. Candidate filtering by area/circularity.
-    7. Nearest-neighbour filtering in physical units (micrometres).
-    8. Reproducible optional random subsampling.
-    9. Circular ROI creation around retained centroids.
+    - Gaussian sigma = 4
+    - tissue threshold = 3 after img_as_ubyte
+    - tissue minimum size = 5000 pixels
+    - closing disk radius = 30 pixels
+    - hole area threshold = 5000 pixels
+    - largest connected tissue component only
+    - 40 erosions with disk radius = 2 pixels
+    - fluorescence threshold = 20
+    - area criterion 2..15 pixels OR roundness >= 0.75
+    - pixel_size_um = 3 * 1.621
+    - nearest-neighbour filtering with sklearn NearestNeighbors
+    - nearest-neighbour range = 140..500 um
+    - random seed = 42
+    - at most 100 objects
+    - circle radius = 40 um
 
-    The generated mask is a scalar UInt8 image with values 0 and 255.
-    Physical geometry and source metadata are copied from the input.
+    By default, output construction and geometry follow the supplied script:
+    spacing = (source_sx, source_sy, 0.01), origin = (0, 0, 0),
+    identity direction, and shrink factors = [1, 1, 1].
 
-    No automatic Otsu thresholding is used.
+    Set preserve_source_geometry=True to copy spacing, origin, and direction
+    from the imported 3D NRRD while leaving the mask-selection algorithm
+    unchanged.
+
+    Using the defaults reproduces the supplied script's masking criteria.
     """
 
     def __init__(self, source):
@@ -64,47 +72,26 @@ class FluorescenceSamplingMask:
                 "FluorescenceSamplingMask requires a scalar image."
             )
 
-        data = sitk.GetArrayFromImage(self.source)
+        # Match the reference script exactly.
+        img = sitk.GetArrayFromImage(self.source)
+        img = np.squeeze(img)
 
-        if data.ndim == 3:
-            if data.shape[0] != 1:
-                raise ValueError(
-                    "Only 2D or single-slice 3D images are currently "
-                    "supported."
-                )
-            data = data[0]
-        elif data.ndim != 2:
+        if img.ndim != 2:
             raise ValueError(
-                "Only 2D or single-slice 3D images are currently supported."
+                "The reference masking workflow requires a 2D image "
+                "or a single-slice 3D scalar image."
             )
 
-        self.image_array = np.asarray(data)
+        self.image_array = img
 
         self.tissue_mask = None
         self.tissue_mask_eroded = None
         self.filtered_object_mask = None
         self.centroids_rc = np.empty((0, 2), dtype=float)
         self.final_mask = None
+        self.binary_mask = None
         self.mask_image = None
         self.parameters = {}
-
-    def _spacing_um(self):
-        spacing = self.source.GetSpacing()
-
-        sx_um = float(spacing[0]) * 1000.0
-        sy_um = float(spacing[1]) * 1000.0
-
-        if (
-            not np.isfinite(sx_um)
-            or not np.isfinite(sy_um)
-            or sx_um <= 0
-            or sy_um <= 0
-        ):
-            raise ValueError(
-                "Source image must have positive finite X/Y spacing."
-            )
-
-        return sx_um, sy_um
 
     def Generate(
         self,
@@ -119,208 +106,370 @@ class FluorescenceSamplingMask:
         tissue_hole_area=5000,
         tissue_erosion_iterations=40,
         tissue_erosion_radius=2,
+        pixel_size_um=3 * 1.621,
         min_nn_um=140,
         max_nn_um=500,
         max_objects=100,
         circle_radius_um=40,
         random_seed=42,
-        foreground_value=255,
+        preserve_source_geometry=False,
     ):
         """
-        Generate the sampling mask.
+        Generate the mask using the supplied reference-script algorithm.
 
-        The defaults reproduce the parameter values from the current
-        fluorescence-mask script, while leaving them user-configurable.
+        For an exact reproduction, call Generate() with the defaults.
         """
         img = self.image_array
-        sx_um, sy_um = self._spacing_um()
 
-        # 1. Broad tissue mask.
+        # --------------------------------------------------------------
+        # Smooth
+        # Reference:
+        # blur = filters.gaussian(img, sigma=4)
+        # blur_uint8 = util.img_as_ubyte(blur)
+        # --------------------------------------------------------------
         blur = filters.gaussian(
             img,
-            sigma=float(tissue_gaussian_sigma),
+            sigma=tissue_gaussian_sigma,
         )
         blur_uint8 = util.img_as_ubyte(blur)
 
-        tissue_mask = blur_uint8 > float(tissue_threshold)
+        # --------------------------------------------------------------
+        # Tissue mask
+        # Reference:
+        # thresh = 3
+        # mask = blur_uint8 > thresh
+        # --------------------------------------------------------------
+        thresh = tissue_threshold
+        mask = blur_uint8 > thresh
 
-        tissue_mask = morphology.remove_small_objects(
-            tissue_mask,
-            min_size=int(tissue_min_size),
+        # Remove tiny regions.
+        mask = morphology.remove_small_objects(
+            mask,
+            min_size=tissue_min_size,
         )
 
-        tissue_mask = morphology.binary_closing(
-            tissue_mask,
-            footprint=morphology.disk(int(tissue_closing_radius)),
+        # Close small gaps.
+        mask = binary_closing(
+            mask,
+            footprint=morph_disk(tissue_closing_radius),
         )
 
-        tissue_mask = ndi.binary_fill_holes(tissue_mask)
+        # Fill holes.
+        mask = ndi.binary_fill_holes(mask)
 
-        tissue_mask = morphology.remove_small_holes(
-            tissue_mask,
-            area_threshold=int(tissue_hole_area),
+        # Remove small holes.
+        mask = morphology.remove_small_holes(
+            mask,
+            area_threshold=tissue_hole_area,
         )
 
-        tissue_labels = measure.label(tissue_mask)
-        tissue_regions = measure.regionprops(tissue_labels)
+        # Keep largest connected component.
+        labels = measure.label(mask)
+        regions = measure.regionprops(labels)
 
-        if not tissue_regions:
-            raise ValueError(
-                "No tissue component found. Adjust tissue_threshold "
-                "or tissue_min_size."
-            )
+        # Intentionally match the reference script:
+        # max() raises if there are no tissue regions.
+        largest = max(regions, key=lambda r: r.area)
+        tissue_mask = labels == largest.label
 
-        largest = max(
-            tissue_regions,
-            key=lambda region: region.area,
-        )
-
-        tissue_mask = tissue_labels == largest.label
+        # Erode tissue exactly as in the reference script.
         tissue_mask_eroded = tissue_mask.copy()
 
-        for _ in range(int(tissue_erosion_iterations)):
-            tissue_mask_eroded = morphology.binary_erosion(
+        for _ in range(tissue_erosion_iterations):
+            tissue_mask_eroded = binary_erosion(
                 tissue_mask_eroded,
-                footprint=morphology.disk(int(tissue_erosion_radius)),
+                footprint=morph_disk(tissue_erosion_radius),
             )
 
-        # 2. Candidate objects inside eroded tissue.
-        candidate_mask = img > float(object_threshold)
-        candidate_mask[tissue_mask_eroded == 0] = False
+        # --------------------------------------------------------------
+        # Fluorescence threshold inside eroded tissue
+        # --------------------------------------------------------------
+        threshold = object_threshold
+        th = threshold
 
-        object_labels = measure.label(candidate_mask)
+        mask = img > th
+        mask[tissue_mask_eroded == 0] = 0
+
+        labels = label(mask)
 
         filtered_mask = np.zeros_like(
-            candidate_mask,
+            mask,
             dtype=bool,
         )
 
-        for region in measure.regionprops(object_labels):
-            area = float(region.area)
+        # --------------------------------------------------------------
+        # Area / circularity filtering
+        # IMPORTANT: preserve OR exactly from reference script.
+        # --------------------------------------------------------------
+        min_size = object_min_size
+        max_size = object_max_size
+
+        for region in regionprops(labels):
+            area = region.area
 
             if region.perimeter > 0:
                 circularity = (
-                    4.0
-                    * np.pi
-                    * area
-                    / (float(region.perimeter) ** 2)
+                    4 * np.pi * area
+                    / (region.perimeter ** 2)
                 )
             else:
-                circularity = 0.0
+                circularity = 0
 
-            # Preserve the rule from the existing script.
-            keep = (
-                (
-                    float(object_min_size)
-                    <= area
-                    <= float(object_max_size)
-                )
-                or circularity >= float(min_roundness)
-            )
-
-            if keep:
+            if (
+                min_size <= area <= max_size
+                or circularity >= min_roundness
+            ):
                 filtered_mask[
-                    object_labels == region.label
+                    labels == region.label
                 ] = True
 
-        # 3. Object centroids.
-        filtered_labels = measure.label(filtered_mask)
-        props = measure.regionprops(filtered_labels)
+        # --------------------------------------------------------------
+        # Physical constants / pixel-space thresholds
+        # Match reference script exactly.
+        # --------------------------------------------------------------
+        pixel_size_um = float(pixel_size_um)
+        circle_radius_um = float(circle_radius_um)
 
-        centroids_rc = np.asarray(
-            [region.centroid for region in props],
-            dtype=float,
+        circle_radius_px = int(
+            round(
+                circle_radius_um
+                / pixel_size_um
+            )
         )
 
-        if centroids_rc.size == 0:
-            centroids_rc = np.empty((0, 2), dtype=float)
+        min_nn_px = (
+            float(min_nn_um)
+            / pixel_size_um
+        )
+        max_nn_px = (
+            float(max_nn_um)
+            / pixel_size_um
+        )
 
-        # 4. Nearest-neighbour filtering in micrometres.
-        if len(centroids_rc) >= 2:
-            centroids_um = np.column_stack(
-                (
-                    centroids_rc[:, 0] * sy_um,
-                    centroids_rc[:, 1] * sx_um,
-                )
+        # --------------------------------------------------------------
+        # Label + centroids
+        # --------------------------------------------------------------
+        labels = label(filtered_mask > 0)
+
+        props = regionprops(labels)
+        centroids = np.array(
+            [p.centroid for p in props]
+        )
+
+        # --------------------------------------------------------------
+        # Nearest-neighbour filtering
+        # Match reference script exactly:
+        # sklearn.neighbors.NearestNeighbors(n_neighbors=2)
+        # --------------------------------------------------------------
+        if len(centroids) >= 1:
+            nbrs = NearestNeighbors(
+                n_neighbors=2
+            )
+            nbrs.fit(centroids)
+
+            distances, _ = nbrs.kneighbors(
+                centroids
             )
 
-            tree = cKDTree(centroids_um)
-            distances, _ = tree.query(centroids_um, k=2)
-            nearest_um = distances[:, 1]
+            # Remove self-distance.
+            nn = distances[:, 1:]
+
+            # The reference comment says "five", but its code uses
+            # only the one non-self neighbour. Preserve the code.
+            mean_nn = nn.mean(axis=1)
 
             keep = (
-                (nearest_um >= float(min_nn_um))
-                & (nearest_um <= float(max_nn_um))
+                (mean_nn >= min_nn_px)
+                & (mean_nn <= max_nn_px)
             )
 
-            centroids_rc = centroids_rc[keep]
+            centroids = centroids[keep]
 
-        elif len(centroids_rc) == 1:
-            # Nearest-neighbour constraints cannot be evaluated
-            # for a single detected object.
-            centroids_rc = np.empty((0, 2), dtype=float)
+        # --------------------------------------------------------------
+        # Random subset
+        # --------------------------------------------------------------
+        rng = np.random.default_rng(
+            random_seed
+        )
 
-        # 5. Reproducible subset.
-        max_objects = int(max_objects)
-
-        if max_objects < 0:
-            raise ValueError("max_objects must be >= 0.")
-
-        if len(centroids_rc) > max_objects:
-            rng = np.random.default_rng(int(random_seed))
+        if len(centroids) > max_objects:
             idx = rng.choice(
-                len(centroids_rc),
+                len(centroids),
                 max_objects,
                 replace=False,
             )
-            centroids_rc = centroids_rc[idx]
+            centroids = centroids[idx]
 
-        # 6. Circular sampling regions.
-        # The current acquisition is isotropic in X/Y. The mean spacing
-        # keeps this usable if tiny numerical differences are present.
-        pixel_size_um = (sx_um + sy_um) / 2.0
-
-        circle_radius_px = int(
-            round(float(circle_radius_um) / pixel_size_um)
-        )
-
-        if circle_radius_px < 1:
-            raise ValueError(
-                "circle_radius_um is smaller than one image pixel."
-            )
-
+        # --------------------------------------------------------------
+        # Create final circular ROI mask
+        # --------------------------------------------------------------
         final_mask = np.zeros(
-            filtered_labels.shape,
+            labels.shape,
             dtype=bool,
         )
 
-        for row, col in centroids_rc:
+        for r, c in centroids:
             rr, cc = disk(
-                (row, col),
+                (r, c),
                 circle_radius_px,
                 shape=final_mask.shape,
             )
+
             final_mask[rr, cc] = True
 
-        output_array = (
-            final_mask.astype(np.uint8)
-            * int(foreground_value)
+        # --------------------------------------------------------------
+        # Reproduce the reference mask conversion path.
+        # Plotting itself is omitted because it does not change the result.
+        # --------------------------------------------------------------
+        final_mask_for_output = final_mask.astype(
+            np.float32
+        )
+        final_mask_for_output[
+            final_mask_for_output == 0
+        ] = np.nan
+
+        if np.any(
+            np.isfinite(final_mask_for_output)
+        ):
+            final_mask_for_output = (
+                final_mask_for_output
+                / np.nanmax(final_mask_for_output)
+            )
+
+        binary_mask = (
+            np.nan_to_num(
+                final_mask_for_output
+            )
+            > 0
         )
 
-        if self.source.GetDimension() == 3:
-            output_array = output_array[np.newaxis, ...]
-
-        mask_image = sitk.GetImageFromArray(
-            output_array,
-            isVector=False,
+        binary_mask = (
+            binary_mask.astype(np.uint8)
+            * 255
         )
 
-        _copy_information_and_metadata(
-            self.source,
-            mask_image,
+        # --------------------------------------------------------------
+        # Reproduce original RGB -> grayscale output construction.
+        # --------------------------------------------------------------
+        rgb = np.stack(
+            [binary_mask] * 3,
+            axis=-1,
         )
 
-        parameters = {
+        out_arr = rgb[np.newaxis, ...]
+
+        out_img = sitk.GetImageFromArray(
+            out_arr,
+            isVector=True,
+        )
+
+        r = sitk.VectorIndexSelectionCast(
+            out_img,
+            0,
+            sitk.sitkFloat32,
+        )
+        g = sitk.VectorIndexSelectionCast(
+            out_img,
+            1,
+            sitk.sitkFloat32,
+        )
+        b = sitk.VectorIndexSelectionCast(
+            out_img,
+            2,
+            sitk.sitkFloat32,
+        )
+
+        gray = (
+            0.299 * r
+            + 0.587 * g
+            + 0.114 * b
+        )
+
+        out_img = sitk.Cast(
+            gray,
+            sitk.sitkUInt8,
+        )
+
+        # --------------------------------------------------------------
+        # Output geometry.
+        #
+        # False = reproduce the supplied reference script exactly.
+        # True  = preserve the geometry of the imported NRRD.
+        #
+        # This option changes ONLY physical geometry. It does not change
+        # tissue detection, object selection, nearest-neighbour filtering,
+        # random selection, or final mask pixels.
+        # --------------------------------------------------------------
+        if preserve_source_geometry:
+            if self.source.GetDimension() != 3:
+                raise ValueError(
+                    "preserve_source_geometry=True requires a 3D "
+                    "single-slice source image."
+                )
+
+            if tuple(out_img.GetSize()) != tuple(self.source.GetSize()):
+                raise ValueError(
+                    "Cannot copy source geometry because source and "
+                    "mask sizes differ."
+                )
+
+            out_img.SetSpacing(
+                self.source.GetSpacing()
+            )
+            out_img.SetOrigin(
+                self.source.GetOrigin()
+            )
+            out_img.SetDirection(
+                self.source.GetDirection()
+            )
+
+        else:
+            # Match the supplied reference script exactly.
+            spacing = self.source.GetSpacing()
+            sx = spacing[0]
+            sy = spacing[1]
+
+            out_img.SetSpacing(
+                (sx, sy, 0.01)
+            )
+
+            out_img.SetOrigin(
+                (0.0, 0.0, 0.0)
+            )
+
+            out_img.SetDirection(
+                (
+                    1.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0,
+                    0.0, 0.0, 1.0,
+                )
+            )
+
+        # --------------------------------------------------------------
+        # Optional downsampling from reference script:
+        # x_filter = 1
+        # y_filter = 1
+        # --------------------------------------------------------------
+        x_filter = 1
+        y_filter = 1
+
+        shrink = sitk.ShrinkImageFilter()
+        shrink.SetShrinkFactors(
+            [x_filter, y_filter, 1]
+        )
+
+        out_img = shrink.Execute(out_img)
+
+        # Store state for inspection.
+        self.tissue_mask = tissue_mask
+        self.tissue_mask_eroded = tissue_mask_eroded
+        self.filtered_object_mask = filtered_mask
+        self.centroids_rc = centroids
+        self.final_mask = final_mask
+        self.binary_mask = binary_mask
+        self.mask_image = out_img
+
+        self.parameters = {
             "object_threshold": object_threshold,
             "object_min_size": object_min_size,
             "object_max_size": object_max_size,
@@ -332,68 +481,54 @@ class FluorescenceSamplingMask:
             "tissue_hole_area": tissue_hole_area,
             "tissue_erosion_iterations": tissue_erosion_iterations,
             "tissue_erosion_radius": tissue_erosion_radius,
+            "pixel_size_um": pixel_size_um,
             "min_nn_um": min_nn_um,
             "max_nn_um": max_nn_um,
             "max_objects": max_objects,
             "circle_radius_um": circle_radius_um,
             "random_seed": random_seed,
-            "foreground_value": foreground_value,
-            "pixel_size_x_um": sx_um,
-            "pixel_size_y_um": sy_um,
-            "selected_objects": len(centroids_rc),
+            "preserve_source_geometry": preserve_source_geometry,
+            "selected_objects": len(centroids),
         }
-
-        mask_image.SetMetaData(
-            "pymirimaging.modality",
-            "mask",
-        )
-        mask_image.SetMetaData(
-            "pymirimaging.mask.type",
-            "fluorescence_sampling_mask",
-        )
-        mask_image.SetMetaData(
-            "pymirimaging.mask.method",
-            "fluorescence_sampling",
-        )
-
-        for key, value in parameters.items():
-            mask_image.SetMetaData(
-                f"pymirimaging.mask.{key}",
-                str(value),
-            )
-
-        self.tissue_mask = tissue_mask
-        self.tissue_mask_eroded = tissue_mask_eroded
-        self.filtered_object_mask = filtered_mask
-        self.centroids_rc = centroids_rc
-        self.final_mask = final_mask
-        self.mask_image = mask_image
-        self.parameters = parameters
 
         return self
 
     def GetMaskImage(self):
         if self.mask_image is None:
-            raise RuntimeError("Generate() must be called first.")
+            raise RuntimeError(
+                "Generate() must be called first."
+            )
         return self.mask_image
 
     def GetArray(self, squeeze=True):
-        arr = sitk.GetArrayFromImage(self.GetMaskImage())
-        return np.squeeze(arr) if squeeze else arr
+        arr = sitk.GetArrayFromImage(
+            self.GetMaskImage()
+        )
+        return (
+            np.squeeze(arr)
+            if squeeze
+            else arr
+        )
 
     def GetTissueMask(self):
         if self.tissue_mask is None:
-            raise RuntimeError("Generate() must be called first.")
+            raise RuntimeError(
+                "Generate() must be called first."
+            )
         return self.tissue_mask.copy()
 
     def GetErodedTissueMask(self):
         if self.tissue_mask_eroded is None:
-            raise RuntimeError("Generate() must be called first.")
+            raise RuntimeError(
+                "Generate() must be called first."
+            )
         return self.tissue_mask_eroded.copy()
 
     def GetFilteredObjectMask(self):
         if self.filtered_object_mask is None:
-            raise RuntimeError("Generate() must be called first.")
+            raise RuntimeError(
+                "Generate() must be called first."
+            )
         return self.filtered_object_mask.copy()
 
     def GetCentroids(self):
@@ -405,10 +540,13 @@ class FluorescenceSamplingMask:
     def WriteNRRD(
         self,
         output_path,
-        use_compression=True,
+        use_compression=False,
     ):
         output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
 
         sitk.WriteImage(
             self.GetMaskImage(),
