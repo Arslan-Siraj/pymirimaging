@@ -40,6 +40,7 @@ def test_raw_zarr_selected_channels_to_nrrd(tmp_path):
         output,
         wavenumbers=[1650.0, 1690.0],
         selection="Exact",
+        rotate=90,
     )
 
     image = sitk.ReadImage(str(output))
