@@ -150,6 +150,69 @@ class ImageReader:
         self.image.SetMetaData(str(key), str(value))
         return self
 
+    def SelectChannel(self, channel):
+        """
+        Convert a vector image to a scalar image by selecting one channel.
+
+        Parameters
+        ----------
+        channel : int
+            Zero-based channel index.
+
+            For a standard RGB image:
+            0 = red
+            1 = green
+            2 = blue
+        """
+        channel = int(channel)
+
+        number_of_components = (
+            self.GetNumberOfComponentsPerPixel()
+        )
+
+        if number_of_components == 1:
+            if channel != 0:
+                raise ValueError(
+                    "Image is already scalar. "
+                    "Only channel=0 is valid."
+                )
+            return self
+
+        if (
+            channel < 0
+            or channel >= number_of_components
+        ):
+            raise ValueError(
+                f"Invalid channel {channel}. "
+                f"Image has {number_of_components} components."
+            )
+
+        metadata = self.GetMetaData()
+
+        scalar = sitk.VectorIndexSelectionCast(
+            self.image,
+            channel,
+        )
+
+        for key, value in metadata.items():
+            try:
+                scalar.SetMetaData(
+                    str(key),
+                    str(value),
+                )
+            except RuntimeError:
+                pass
+
+        scalar.SetMetaData(
+            "pymirimaging.image.selected_channel",
+            str(channel),
+        )
+
+        self.image = scalar
+        self._refresh_array()
+
+        return self
+
     def PromoteTo3D(
         self,
         z_spacing=0.01,
