@@ -559,16 +559,66 @@ class ZarrSpectrumReader:
         selection=None,
         tolerance=None,
         use_compression=True,
-        rotate_raw=True,
+        rotate=0,
     ):
         """
         Export MIR data as an M2aia-compatible vector NRRD.
 
-        wavenumbers=None exports every measured channel.
-        For legacy/raw Zarr, a 90 degree counterclockwise rotation is
-        applied by default, matching the supplied conversion script.
-        Zarr created from NRRD is tagged orientation='m2aia_nrrd' and
-        will not be rotated again.
+        Parameters
+        ----------
+        output_path : str or pathlib.Path
+            Destination NRRD file.
+
+        wavenumbers : scalar, sequence, or None, default=None
+            Wavenumber(s) to export. ``None`` exports every measured
+            spectral channel.
+
+        dtype : numpy dtype, default=np.float32
+            Output floating-point dtype. Supported values are
+            ``np.float32`` and ``np.float64``.
+
+        selection : str or enum-like, optional
+            Spectral selection strategy used for requested wavenumbers.
+            If omitted, the reader's current spectral-selection setting
+            is used. When ``wavenumbers=None``, exact measured channels
+            are exported.
+
+        tolerance : float, optional
+            Spectral-selection tolerance in cm^-1.
+
+        use_compression : bool, default=True
+            Enable compression when writing the NRRD.
+
+        rotate : int or float, default=0
+            Spatial rotation applied immediately before NRRD export,
+            in degrees.
+
+            Positive values rotate counterclockwise.
+            Negative values rotate clockwise.
+
+            Only multiples of 90 degrees are supported because these
+            rotations are exact and do not require interpolation.
+
+            Examples
+            --------
+            ``rotate=0``   : no rotation
+            ``rotate=90``  : 90 degrees counterclockwise
+            ``rotate=-90`` : 90 degrees clockwise
+            ``rotate=180`` : 180 degrees
+
+            Arbitrary angles such as 45 degrees are intentionally not
+            supported by this writer because they require interpolation
+            and resampling. Such transforms belong in an image
+            processing/resampling operation.
+
+        Notes
+        -----
+        Rotation is never inferred from Zarr metadata. The default is
+        always ``rotate=0`` so the user explicitly controls any spatial
+        transformation.
+
+        For 90- or 270-degree quarter turns, X/Y spacing is swapped.
+        Origin and direction are otherwise carried through unchanged.
         """
         if dtype not in (np.float32, np.float64):
             raise TypeError(
@@ -610,13 +660,49 @@ class ZarrSpectrumReader:
         ]
         data = np.stack(channels, axis=-1)
 
-        orientation = str(
-            self.root.attrs.get("orientation", "raw_mir")
-        )
-        should_rotate = rotate_raw and orientation != "m2aia_nrrd"
+        # Rotation is explicit and user-controlled.
+        # Positive angles are counterclockwise, matching np.rot90.
+        if isinstance(rotate, (bool, np.bool_)):
+            raise ValueError(
+                "rotate must be a numeric multiple of 90 degrees, "
+                "not a boolean."
+            )
 
-        if should_rotate:
-            data = np.rot90(data, axes=(1, 2))
+        try:
+            rotate_value = float(rotate)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "rotate must be a numeric multiple of 90 degrees."
+            ) from exc
+
+        if not np.isfinite(rotate_value):
+            raise ValueError(
+                "rotate must be a finite numeric multiple of 90 degrees."
+            )
+
+        if not rotate_value.is_integer():
+            raise ValueError(
+                "rotate must be an integer multiple of 90 degrees."
+            )
+
+        rotation_degrees = int(rotate_value)
+
+        if rotation_degrees % 90 != 0:
+            raise ValueError(
+                "rotate must be a multiple of 90 degrees, for example "
+                "0, 90, -90, 180, or 270."
+            )
+
+        # np.rot90 uses the number of 90-degree CCW quarter turns.
+        # Normalizing to 0..3 also handles negative and >360 angles.
+        rotation_k = (rotation_degrees // 90) % 4
+
+        if rotation_k:
+            data = np.rot90(
+                data,
+                k=rotation_k,
+                axes=(1, 2),
+            )
 
         # data is (Z,Y,X,C). Write a 2D vector image when the source is
         # raw 2D and no pz/3D geometry is available.
@@ -629,7 +715,8 @@ class ZarrSpectrumReader:
             origin = self._origin.copy()
             direction = self._direction.copy()
 
-            if should_rotate and len(spacing) >= 2:
+            # Quarter turns of 90 or 270 degrees exchange X and Y.
+            if rotation_k in (1, 3) and len(spacing) >= 2:
                 spacing = spacing.copy()
                 spacing[0], spacing[1] = spacing[1], spacing[0]
 
@@ -705,6 +792,10 @@ class ZarrSpectrumReader:
         image.SetMetaData(
             "pymirimaging.processing.image_normalization",
             self.image_normalization,
+        )
+        image.SetMetaData(
+            "pymirimaging.export.rotation_degrees",
+            str(rotation_degrees),
         )
 
         source_metadata = self.root.attrs.get(
