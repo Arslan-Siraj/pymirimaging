@@ -1,6 +1,7 @@
 from .ZarrSpectrumReader import ZarrSpectrumReader
 from .NRRDSpectrumReader import NRRDSpectrumReader
 from .ImageReader import ImageReader
+from .ImageProcessing import FluorescenceSamplingMask
 from .enums import (
     m2Normalization,
     m2Pooling,
@@ -23,6 +24,7 @@ __all__ = [
     "ZarrSpectrumReader",
     "NRRDSpectrumReader",
     "ImageReader",
+    "FluorescenceSamplingMask",
     "m2Normalization",
     "m2Pooling",
     "m2ImageNormalization",

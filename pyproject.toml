@@ -12,6 +12,8 @@ dependencies = [
     "numpy>=1.23",
     "SimpleITK>=2.2",
     "zarr>=2.16,<3",
+    "scipy>=1.9",
+    "scikit-image>=0.20",
 ]
 
 [project.optional-dependencies]

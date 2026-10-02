@@ -1,6 +1,8 @@
 numpy>=1.23
 SimpleITK>=2.2
 zarr<3,>=2.16
+scipy>=1.9
+scikit-image>=0.20
 
 [test]
 pytest>=7

@@ -11,6 +11,8 @@ src/pymirimaging.egg-info/SOURCES.txt
 src/pymirimaging.egg-info/dependency_links.txt
 src/pymirimaging.egg-info/requires.txt
 src/pymirimaging.egg-info/top_level.txt
+src/pymirimaging/ImageProcessing/FluorescenceSamplingMask.py
+src/pymirimaging/ImageProcessing/__init__.py
 src/pymirimaging/MIRprocessing/BaselineCorrection.py
 src/pymirimaging/MIRprocessing/ImageNormalization.py
 src/pymirimaging/MIRprocessing/ImageSmoothing.py
