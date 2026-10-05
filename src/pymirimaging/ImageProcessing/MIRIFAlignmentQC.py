@@ -256,7 +256,7 @@ def _make_edge_map(
     )
 
     if dilation_radius > 0:
-        edge = morphology.binary_dilation(
+        edge = morphology.dilation(
             edge,
             footprint=morphology.disk(
                 dilation_radius
@@ -383,7 +383,7 @@ def _erode_support_physical(
         ),
     )
 
-    eroded = morphology.binary_erosion(
+    eroded = morphology.erosion(
         support,
         footprint=morphology.disk(
             radius_px
@@ -709,6 +709,226 @@ def _shift_image_geometry(
     return shifted
 
 
+def _rigid_adjust_image_geometry(
+    image: sitk.Image,
+    reference: sitk.Image,
+    dx_um: float = 0.0,
+    dy_um: float = 0.0,
+    angle_deg: float = 0.0,
+    center_physical: Optional[
+        Tuple[float, ...]
+    ] = None,
+) -> sitk.Image:
+    """
+    Apply a small in-plane rigid correction by changing image geometry only.
+
+    The pixel array is NOT resampled here.
+
+    Parameters
+    ----------
+    image
+        Image whose physical geometry will be adjusted.
+
+    reference
+        Fixed reference defining the x/y index axes used by the QC search.
+        For direct MIR↔IF refinement this is the MIR image.
+
+    dx_um, dy_um
+        Translation in micrometers along the reference x/y index axes.
+
+    angle_deg
+        In-plane rotation in degrees using the SAME sign convention as the
+        NumPy/SciPy QC search:
+            positive = counter-clockwise in the displayed image.
+
+    center_physical
+        Physical-space rotation center.  If None, the physical center of the
+        reference image is used.
+
+    Returns
+    -------
+    SimpleITK.Image
+        Copy of ``image`` with updated Origin and Direction.
+
+    Notes
+    -----
+    The transform applied to each original physical point p is
+
+        p_new = c + R (p - c) + t
+
+    where c is the physical rotation center, R is the in-plane rotation
+    expressed in physical coordinates, and t is the translation.
+
+    Size, Spacing, and the original pixel values are preserved exactly.
+    """
+    if (
+        image.GetDimension()
+        != reference.GetDimension()
+    ):
+        raise ValueError(
+            "image and reference must have the same dimension."
+        )
+
+    dim = image.GetDimension()
+
+    if dim not in (2, 3):
+        raise ValueError(
+            "Rigid in-plane refinement currently supports 2D images "
+            "or single-slice 3D images."
+        )
+
+    if dim == 3:
+        if (
+            image.GetSize()[2] != 1
+            or reference.GetSize()[2] != 1
+        ):
+            raise ValueError(
+                "3D rigid refinement is restricted to single-slice images."
+            )
+
+    corrected = sitk.Image(
+        image
+    )
+
+    # Reference Direction maps reference-index-axis vectors into
+    # physical-space vectors.
+    d_ref = np.asarray(
+        reference.GetDirection(),
+        dtype=float,
+    ).reshape(
+        dim,
+        dim,
+    )
+
+    d_img = np.asarray(
+        image.GetDirection(),
+        dtype=float,
+    ).reshape(
+        dim,
+        dim,
+    )
+
+    theta = np.deg2rad(
+        float(angle_deg)
+    )
+
+    cth = float(
+        np.cos(theta)
+    )
+    sth = float(
+        np.sin(theta)
+    )
+
+    # scipy.ndimage.rotate positive angle = counter-clockwise visually.
+    # In array/index coordinates y increases downward, therefore the
+    # corresponding x/y coordinate transform is:
+    #
+    #   x' =  cos(theta) * x + sin(theta) * y
+    #   y' = -sin(theta) * x + cos(theta) * y
+    #
+    # This matrix exactly represents that sign convention.
+    r_index = np.eye(
+        dim,
+        dtype=float,
+    )
+
+    r_index[0, 0] = cth
+    r_index[0, 1] = sth
+    r_index[1, 0] = -sth
+    r_index[1, 1] = cth
+
+    # Convert the reference-index-axis rotation into physical coordinates.
+    #
+    # Direction matrices are orthonormal, so inverse(D) == transpose(D).
+    r_physical = (
+        d_ref
+        @ r_index
+        @ d_ref.T
+    )
+
+    shift_index_mm = np.zeros(
+        dim,
+        dtype=float,
+    )
+
+    shift_index_mm[0] = (
+        float(dx_um) / 1000.0
+    )
+
+    shift_index_mm[1] = (
+        float(dy_um) / 1000.0
+    )
+
+    # Translation is specified along MIR/reference index axes.
+    shift_physical_mm = (
+        d_ref
+        @ shift_index_mm
+    )
+
+    if center_physical is None:
+        center_index = [
+            0.5 * (
+                float(size) - 1.0
+            )
+            for size in reference.GetSize()
+        ]
+
+        center_physical_arr = np.asarray(
+            reference.TransformContinuousIndexToPhysicalPoint(
+                tuple(center_index)
+            ),
+            dtype=float,
+        )
+    else:
+        center_physical_arr = np.asarray(
+            center_physical,
+            dtype=float,
+        )
+
+        if center_physical_arr.shape != (
+            dim,
+        ):
+            raise ValueError(
+                "center_physical must have one coordinate per image dimension."
+            )
+
+    old_origin = np.asarray(
+        image.GetOrigin(),
+        dtype=float,
+    )
+
+    new_origin = (
+        center_physical_arr
+        + r_physical
+        @ (
+            old_origin
+            - center_physical_arr
+        )
+        + shift_physical_mm
+    )
+
+    new_direction = (
+        r_physical
+        @ d_img
+    )
+
+    corrected.SetOrigin(
+        tuple(
+            float(v)
+            for v in new_origin
+        )
+    )
+
+    corrected.SetDirection(
+        tuple(
+            float(v)
+            for v in new_direction.ravel()
+        )
+    )
+
+    return corrected
+
+
 class MIRIFAlignmentQC:
     """
     Quality-control and small residual-refinement workflow for pre-aligned MIR,
@@ -724,7 +944,9 @@ class MIRIFAlignmentQC:
             ↓
         Direct MIR ↔ IF residual estimation
             ↓
-        optional small translation of IF + plaque mask together
+        compare translation-only vs rigid refinement
+            ↓
+        apply rotation only if it adds sufficient score beyond translation
             ↓
         closed-loop validation
             ↓
@@ -742,7 +964,7 @@ class MIRIFAlignmentQC:
 
     if_aligned
         Pre-aligned fluorescence image. IF may receive a small,
-        translation-only residual correction if all safety gates pass.
+        small rigid residual correction if all safety gates pass.
 
     mask_aligned
         Plaque mask derived from IF. It must have the same geometry as IF and
@@ -769,8 +991,7 @@ class MIRIFAlignmentQC:
 
     Fail-fast philosophy
     --------------------
-    The local optimizer is only allowed to refine an already reasonable initial alignment
-    alignment. If the initial error is too large, structural agreement is too
+    The local optimizer is only allowed to refine an already reasonable initial alignment. If the initial error is too large, structural agreement is too
     weak, the optimum hits a search boundary, or the post-correction result is
     unstable, the class stops rather than creating a training label.
 
@@ -785,7 +1006,7 @@ class MIRIFAlignmentQC:
         Set to 0 to disable plaque zoom panels.
 
     auto_refine : bool, default True
-        If True, apply a small safe translation to IF + mask when all gates pass.
+        If True, apply a small safe rigid correction (translation + rotation) to IF + mask when all gates pass.
         MIR and BF are never moved.
 
     save_figures : bool, default True
@@ -810,12 +1031,17 @@ class MIRIFAlignmentQC:
     direct_max_shift_um : float or None, default None
         Maximum direct MIR↔IF residual translation. None means plaque_radius_um.
 
-    direct_max_rotation_deg : float, default 0.25
-        Maximum direct residual rotation for translation-only refinement.
+    direct_max_rotation_deg : float, default 0.5
+        Maximum direct residual rotation eligible for automatic rigid refinement.
 
     min_score_gain : float, default 0.003
         Minimum structural-score improvement required before automatically
-        applying a candidate translation.
+        applying any correction.
+
+    rotation_min_extra_gain : float, default 0.003
+        Minimum additional score improvement that the rigid solution must
+        provide beyond the best translation-only solution before rotation is
+        applied.
 
     post_max_residual_shift_um : float, default 10
         Maximum residual shift allowed after correction.
@@ -845,6 +1071,7 @@ class MIRIFAlignmentQC:
 
     Notes
     -----
+    The defaults intentionally follow the latest validated notebook workflow.
     Search-resolution parameters remain internal because they are algorithm
     details, not routine user controls.
     """
@@ -867,8 +1094,9 @@ class MIRIFAlignmentQC:
         min_gradient_ncc: float = 0.10,
         min_edge_dice: float = 0.40,
         direct_max_shift_um: Optional[float] = None,
-        direct_max_rotation_deg: float = 0.25,
+        direct_max_rotation_deg: float = 0.5,
         min_score_gain: float = 0.003,
+        rotation_min_extra_gain: float = 0.003,
         post_max_residual_shift_um: float = 10.0,
         post_max_rotation_deg: float = 0.25,
         post_max_score_gain: float = 0.003,
@@ -905,7 +1133,7 @@ class MIRIFAlignmentQC:
             Default 6. Use 0 to disable plaque zooms.
 
         auto_refine
-            Apply a small safe IF+mask translation automatically when all
+            Apply a small safe IF+mask rigid correction automatically when all
             quality gates pass. Default True.
 
         save_figures
@@ -933,12 +1161,17 @@ class MIRIFAlignmentQC:
             Default None means plaque_radius_um.
 
         direct_max_rotation_deg
-            Largest direct MIR↔IF residual rotation compatible with
-            translation-only refinement. Default 0.25°.
+            Largest direct MIR↔IF residual rotation eligible for
+            automatic rigid refinement. Default 0.5°.
 
         min_score_gain
-            Minimum score improvement required for automatic translation.
+            Minimum score improvement required before any automatic refinement.
             Default 0.003.
+
+        rotation_min_extra_gain
+            Minimum ADDITIONAL score improvement that rotation must provide
+            beyond the best translation-only solution before rotation is
+            applied. Default 0.003.
 
         post_max_residual_shift_um
             Maximum residual shift allowed after refinement. Default 10 µm.
@@ -967,12 +1200,14 @@ class MIRIFAlignmentQC:
                 "plaque_zoom_count must be >= 0."
             )
 
-        self.auto_apply_safe_translation = bool(auto_refine)
+        self.auto_refine = bool(auto_refine)
+        self.auto_refine = self.auto_refine
         self.save_figures = bool(save_figures)
         self.show_figures = bool(show_figures)
 
         # -------------------------------------------------------------
         # Internal search resolution.
+        # These reproduce the validated notebook and are intentionally
         # not routine public controls.
         # -------------------------------------------------------------
         self.coarse_target_um = 20.0
@@ -1028,6 +1263,10 @@ class MIRIFAlignmentQC:
 
         self.min_score_gain_for_autocorrection = float(
             min_score_gain
+        )
+
+        self.rotation_min_extra_gain = float(
+            rotation_min_extra_gain
         )
 
         self.post_max_residual_shift_um = float(
@@ -1100,7 +1339,7 @@ class MIRIFAlignmentQC:
         3. Visually/structurally assess BF↔MIR and BF↔IF.
         4. Stop if the initial alignment is outside the local-refinement regime.
         5. Estimate the direct MIR↔IF residual.
-        6. Apply a small translation to IF and mask together only when safe.
+        6. Compare translation-only with rigid refinement and apply rotation only when it adds sufficient evidence.
         7. Verify that IF/mask pixel arrays themselves were not altered.
         8. Sample accepted IF and mask onto the exact MIR pixel grid.
         9. Re-run MIR↔IF QC after correction.
@@ -1233,7 +1472,7 @@ class MIRIFAlignmentQC:
         """
         Return short help text for the user-facing parameters.
 
-        This is useful for help, for example:
+        This is useful in notebooks:
 
             import json
             print(json.dumps(
@@ -1251,7 +1490,7 @@ class MIRIFAlignmentQC:
                 "Use 0 to disable plaque zooms."
             ),
             "auto_refine": (
-                "Apply a safe small translation to IF + mask automatically. "
+                "Apply a safe small rigid correction to IF + mask automatically. "
                 "MIR and BF never move. Default True."
             ),
             "save_figures": (
@@ -1283,11 +1522,16 @@ class MIRIFAlignmentQC:
             ),
             "direct_max_rotation_deg": (
                 "Largest direct MIR↔IF rotation compatible with "
-                "translation-only refinement. Default 0.25°."
+                "automatic rigid refinement. Default 0.5°."
             ),
             "min_score_gain": (
-                "Minimum structural-score gain required before automatic "
-                "translation. Default 0.003."
+                "Minimum structural-score gain required before any automatic "
+                "refinement. Default 0.003."
+            ),
+            "rotation_min_extra_gain": (
+                "Rotation is applied only when the best rigid solution "
+                "improves the score by at least this amount beyond the best "
+                "translation-only solution. Default 0.003."
             ),
             "post_max_residual_shift_um": (
                 "Maximum remaining shift after correction. Default 10 µm."
@@ -1306,7 +1550,7 @@ class MIRIFAlignmentQC:
         return {
             "plaque_radius_um": self.plaque_radius_um,
             "plaque_zoom_count": self.plaque_zoom_count,
-            "auto_refine": self.auto_apply_safe_translation,
+            "auto_refine": self.auto_refine,
             "save_figures": self.save_figures,
             "show_figures": self.show_figures,
             "gross_max_shift_um": self.gross_max_shift_um,
@@ -1316,6 +1560,7 @@ class MIRIFAlignmentQC:
             "direct_max_shift_um": self.direct_max_shift_um,
             "direct_max_rotation_deg": self.direct_max_rot_deg,
             "min_score_gain": self.min_score_gain_for_autocorrection,
+            "rotation_min_extra_gain": self.rotation_min_extra_gain,
             "post_max_residual_shift_um": self.post_max_residual_shift_um,
             "post_max_rotation_deg": self.post_max_rot_deg,
             "post_max_score_gain": self.post_max_score_gain,
@@ -1981,6 +2226,7 @@ class MIRIFAlignmentQC:
             float,
         ],
         label: str,
+        rotation_search: bool = True,
     ):
         (
             fixed_crop,
@@ -2035,11 +2281,17 @@ class MIRIFAlignmentQC:
             spacing_coarse[1],
         )
 
+        coarse_angles = (
+            self.coarse_angles_deg
+            if rotation_search
+            else [0.0]
+        )
+
         _, coarse_best = (
             self._search_transforms(
                 maps_coarse,
                 spacing_coarse,
-                self.coarse_angles_deg,
+                coarse_angles,
                 coarse_x,
                 coarse_y,
             )
@@ -2068,19 +2320,22 @@ class MIRIFAlignmentQC:
             )
         )
 
-        fine_angles = np.arange(
-            (
-                coarse_best["angle_deg"]
-                - self.fine_angle_radius_deg
-            ),
-            (
-                coarse_best["angle_deg"]
-                + self.fine_angle_radius_deg
-                + 0.5
-                * self.fine_angle_step_deg
-            ),
-            self.fine_angle_step_deg,
-        )
+        if rotation_search:
+            fine_angles = np.arange(
+                (
+                    coarse_best["angle_deg"]
+                    - self.fine_angle_radius_deg
+                ),
+                (
+                    coarse_best["angle_deg"]
+                    + self.fine_angle_radius_deg
+                    + 0.5
+                    * self.fine_angle_step_deg
+                ),
+                self.fine_angle_step_deg,
+            )
+        else:
+            fine_angles = [0.0]
 
         fine_x = np.arange(
             (
@@ -2169,6 +2424,9 @@ class MIRIFAlignmentQC:
             "fixed_crop": fixed_crop,
             "moving_crop": moving_crop,
             "support_crop": support_crop,
+            "rotation_search": bool(
+                rotation_search
+            ),
         }
 
     # =================================================================
@@ -2829,6 +3087,25 @@ class MIRIFAlignmentQC:
     def _run_direct_mir_if_qc(
         self,
     ):
+        """
+        Compare MIR and IF directly and decide whether rotation is actually needed.
+
+        Two optimizations are run on the same MIR/IF pair:
+
+        1. translation-only:
+              dx, dy, angle = 0
+
+        2. rigid:
+              dx, dy, angle
+
+        Rotation is selected only when the rigid solution improves the score
+        over the best translation-only solution by at least
+        ``rotation_min_extra_gain``.
+
+        This prevents a small non-zero angle from being applied merely because
+        it is the numerical optimum when translation alone is essentially just
+        as good.
+        """
         self.mir_native = (
             _squeeze2d(
                 self.mir_img
@@ -2872,49 +3149,153 @@ class MIRIFAlignmentQC:
             * 1000.0,
         )
 
+        # -------------------------------------------------------------
+        # Full small-rigid search: translation + rotation.
+        # -------------------------------------------------------------
         self.mir_if_direct_qc = (
             self._run_pair_qc(
                 self.mir_native,
                 self.if_on_mir_for_qc,
                 self.if_on_mir_support,
                 self.mir_spacing_xy_um,
-                "MIR ↔ IF direct",
+                "MIR ↔ IF direct rigid",
+                rotation_search=True,
             )
         )
 
-        direct_best = (
+        # -------------------------------------------------------------
+        # Independent translation-only search on the same data.
+        # -------------------------------------------------------------
+        self.mir_if_translation_only_qc = (
+            self._run_pair_qc(
+                self.mir_native,
+                self.if_on_mir_for_qc,
+                self.if_on_mir_support,
+                self.mir_spacing_xy_um,
+                "MIR ↔ IF translation only",
+                rotation_search=False,
+            )
+        )
+
+        rigid_best = (
             self.mir_if_direct_qc[
                 "fine_best"
             ]
         )
 
+        translation_best = (
+            self.mir_if_translation_only_qc[
+                "fine_best"
+            ]
+        )
+
+        rigid_score = float(
+            rigid_best["score"]
+        )
+
+        translation_score = float(
+            translation_best["score"]
+        )
+
+        self.rotation_extra_gain = float(
+            rigid_score
+            - translation_score
+        )
+
+        # Numerical roundoff can make the nominally more flexible rigid
+        # solution lower by a tiny amount.  Such a result never justifies
+        # rotation.
+        self.rotation_required = bool(
+            abs(
+                float(
+                    rigid_best[
+                        "angle_deg"
+                    ]
+                )
+            )
+            > 1e-12
+            and self.rotation_extra_gain
+            >= self.rotation_min_extra_gain
+        )
+
+        if self.rotation_required:
+            self.selected_refinement_mode = (
+                "rigid"
+            )
+            selected_qc = (
+                self.mir_if_direct_qc
+            )
+            selected_best = rigid_best
+        else:
+            self.selected_refinement_mode = (
+                "translation_only"
+            )
+            selected_qc = (
+                self.mir_if_translation_only_qc
+            )
+            selected_best = (
+                translation_best
+            )
+
+        self.selected_direct_qc = (
+            selected_qc
+        )
+
         self.direct_dx_um = float(
-            direct_best[
+            selected_best[
                 "shift_x_um"
             ]
         )
 
         self.direct_dy_um = float(
-            direct_best[
+            selected_best[
                 "shift_y_um"
             ]
         )
 
         self.direct_rot_deg = float(
-            direct_best[
+            selected_best[
                 "angle_deg"
             ]
         )
 
         self.direct_shift_mag_um = float(
-            self.mir_if_direct_qc[
+            selected_qc[
                 "correction_magnitude_um"
             ]
         )
 
         self.direct_score_gain = float(
-            self.mir_if_direct_qc[
+            selected_qc[
                 "score_gain_vs_zero"
+            ]
+        )
+
+        # Useful diagnostics retained separately for JSON reporting.
+        self.rigid_candidate_dx_um = float(
+            rigid_best[
+                "shift_x_um"
+            ]
+        )
+        self.rigid_candidate_dy_um = float(
+            rigid_best[
+                "shift_y_um"
+            ]
+        )
+        self.rigid_candidate_rot_deg = float(
+            rigid_best[
+                "angle_deg"
+            ]
+        )
+
+        self.translation_candidate_dx_um = float(
+            translation_best[
+                "shift_x_um"
+            ]
+        )
+        self.translation_candidate_dy_um = float(
+            translation_best[
+                "shift_y_um"
             ]
         )
 
@@ -2924,6 +3305,7 @@ class MIRIFAlignmentQC:
             ),
             run_status="RUNNING",
         )
+
 
     @staticmethod
     def _search_boundary_flags(
@@ -3012,10 +3394,48 @@ class MIRIFAlignmentQC:
     def _apply_direct_gate(
         self,
     ):
-        self.direct_boundary = (
-            self._search_boundary_flags(
-                self.mir_if_direct_qc
+        """
+        Apply strict trust rules to the selected direct refinement.
+
+        When rotation does not add enough score beyond translation alone,
+        the selected correction is translation-only and the applied angle is
+        exactly 0 degrees.
+
+        When rotation is demonstrably useful, the selected correction is the
+        rigid solution and the usual direct rotation limit applies.
+        """
+        if self.rotation_required:
+            selected_boundary = (
+                self._search_boundary_flags(
+                    self.mir_if_direct_qc
+                )
             )
+        else:
+            # Translation-only search has only angle=0, so its generic
+            # boundary detector would always label angle as a boundary.
+            # Only x/y boundaries matter when no rotation will be applied.
+            translation_boundary = (
+                self._search_boundary_flags(
+                    self.mir_if_translation_only_qc
+                )
+            )
+
+            selected_boundary = {
+                "x_boundary": bool(
+                    translation_boundary[
+                        "x_boundary"
+                    ]
+                ),
+                "y_boundary": bool(
+                    translation_boundary[
+                        "y_boundary"
+                    ]
+                ),
+                "angle_boundary": False,
+            }
+
+        self.direct_boundary = (
+            selected_boundary
         )
 
         self.direct_search_hit_boundary = (
@@ -3024,14 +3444,17 @@ class MIRIFAlignmentQC:
             )
         )
 
-        self.direct_structure_ok = (
+        # Current/no-correction structural evidence is common to both searches.
+        zero = (
             self.mir_if_direct_qc[
                 "zero"
-            ]["ncc"]
+            ]
+        )
+
+        self.direct_structure_ok = (
+            zero["ncc"]
             >= self.direct_min_grad_ncc
-            and self.mir_if_direct_qc[
-                "zero"
-            ]["edge_dice"]
+            and zero["edge_dice"]
             >= self.direct_min_edge_dice
         )
 
@@ -3052,8 +3475,14 @@ class MIRIFAlignmentQC:
 
         self.correction_recommended = (
             self.direct_match_trustworthy
-            and self.direct_shift_mag_um
-            > 0.0
+            and (
+                self.direct_shift_mag_um
+                > 0.0
+                or abs(
+                    self.direct_rot_deg
+                )
+                > 1e-12
+            )
             and self.direct_score_gain
             >= self.min_score_gain_for_autocorrection
         )
@@ -3084,72 +3513,151 @@ class MIRIFAlignmentQC:
                 "STOP — direct MIR↔IF structural agreement "
                 "is not strong enough for automatic refinement. "
                 "Do not generate a training mask from this run. "
-                "Refine the initial alignment in initial alignment first."
+                "Improve the external initial alignment first."
             )
 
-        self.translation_only_safe = (
+        self.rigid_refinement_safe = (
             self.direct_match_trustworthy
+            and self.direct_shift_mag_um
+            <= self.direct_max_shift_um
             and abs(
                 self.direct_rot_deg
             )
-            <= 0.25
-            and self.direct_shift_mag_um
-            <= self.plaque_radius_um
+            <= self.direct_max_rot_deg
             and not self.direct_search_hit_boundary
         )
+
 
     def _plot_direct_qc_diagnostics(
         self,
     ):
+        # Translation-only heatmap shows the best shift without allowing
+        # rotation to "help" the translation estimate.
         self._plot_translation_heatmap(
-            self.mir_if_direct_qc,
-            "direct_mir_if_translation_heatmap",
+            self.mir_if_translation_only_qc,
+            "direct_mir_if_translation_only_heatmap",
         )
 
+        # Rigid rotation profile shows whether an angle actually improves
+        # the score beyond translation alone.
         self._plot_rotation_profile(
             self.mir_if_direct_qc,
             "direct_mir_if_rotation_profile",
         )
 
+        # Show the correction that was actually selected by the necessity rule.
         self._show_current_vs_best(
-            self.mir_if_direct_qc,
+            self.selected_direct_qc,
             self.mir_spacing_xy_um,
-            "direct_mir_if",
+            "direct_mir_if_selected",
         )
 
+
     # =================================================================
-    # STEP 4 — candidate translation of IF + mask together
+    # STEP 4 — candidate rigid correction of IF + mask together
     # =================================================================
+
+    def _direct_refinement_center_physical(
+        self,
+    ) -> Tuple[float, ...]:
+        """
+        Return the physical rotation center corresponding to the direct-QC crop.
+
+        The direct MIR↔IF search rotates the cropped moving array about the
+        crop center.  Using this same physical center for the geometry update
+        keeps the estimated and applied rigid corrections consistent.
+        """
+        (
+            x0,
+            x1,
+            y0,
+            y1,
+        ) = self.mir_if_direct_qc[
+            "bbox_xyxy"
+        ]
+
+        center_index = [
+            0.5 * (
+                float(x0)
+                + float(x1 - 1)
+            ),
+            0.5 * (
+                float(y0)
+                + float(y1 - 1)
+            ),
+        ]
+
+        if (
+            self.mir_img.GetDimension()
+            == 3
+        ):
+            center_index.append(
+                0.0
+            )
+
+        return tuple(
+            float(v)
+            for v in self.mir_img.TransformContinuousIndexToPhysicalPoint(
+                tuple(center_index)
+            )
+        )
 
     def _prepare_candidate_correction(
         self,
     ):
+        """
+        Prepare the candidate small rigid refinement.
+
+        MIR remains fixed.
+
+        IF and the plaque mask receive the same selected correction:
+            - x translation,
+            - y translation,
+            - in-plane rotation only when rotation adds enough evidence.
+
+        Only image geometry (Origin + Direction) is changed here, so the
+        original IF and mask pixel arrays remain exactly unchanged.
+        """
         self.correction_applied = (
-            self.auto_apply_safe_translation
-            and self.translation_only_safe
+            self.auto_refine
+            and self.rigid_refinement_safe
             and self.correction_recommended
         )
 
         if self.correction_applied:
+            self.refinement_center_physical = (
+                self._direct_refinement_center_physical()
+            )
+
             self.if_refined_image = (
-                _shift_image_geometry(
+                _rigid_adjust_image_geometry(
                     self.if_img,
+                    reference=self.mir_img,
                     dx_um=self.direct_dx_um,
                     dy_um=self.direct_dy_um,
-                    axis_reference=self.mir_img,
+                    angle_deg=self.direct_rot_deg,
+                    center_physical=(
+                        self.refinement_center_physical
+                    ),
                 )
             )
 
             self.mask_refined_image = (
-                _shift_image_geometry(
+                _rigid_adjust_image_geometry(
                     self.mask_img,
+                    reference=self.mir_img,
                     dx_um=self.direct_dx_um,
                     dy_um=self.direct_dy_um,
-                    axis_reference=self.mir_img,
+                    angle_deg=self.direct_rot_deg,
+                    center_physical=(
+                        self.refinement_center_physical
+                    ),
                 )
             )
 
         else:
+            self.refinement_center_physical = None
+
             self.if_refined_image = (
                 sitk.Image(
                     self.if_img
@@ -3164,7 +3672,7 @@ class MIRIFAlignmentQC:
 
         self._write_json_checkpoint(
             stage=(
-                "candidate correction prepared"
+                "candidate rigid correction prepared"
             ),
             run_status="RUNNING",
         )
@@ -3353,7 +3861,8 @@ class MIRIFAlignmentQC:
                 "MIR + IF AFTER automatic direct refinement"
                 + (
                     f"\nΔx={self.direct_dx_um:.1f} µm, "
-                    f"Δy={self.direct_dy_um:.1f} µm"
+                    f"Δy={self.direct_dy_um:.1f} µm, "
+                    f"θ={self.direct_rot_deg:.2f}°"
                 )
             )
         else:
@@ -4279,17 +4788,67 @@ class MIRIFAlignmentQC:
                     self.mir_if_direct_qc
                 )
             ),
+            "direct_translation_only_before": (
+                self._compact_qc(
+                    self.mir_if_translation_only_qc
+                )
+            ),
+            "rotation_necessity": {
+                "rigid_best_score": float(
+                    self.mir_if_direct_qc[
+                        "fine_best"
+                    ]["score"]
+                ),
+                "translation_only_best_score": float(
+                    self.mir_if_translation_only_qc[
+                        "fine_best"
+                    ]["score"]
+                ),
+                "extra_gain_from_rotation": float(
+                    self.rotation_extra_gain
+                ),
+                "min_extra_gain_required": float(
+                    self.rotation_min_extra_gain
+                ),
+                "rotation_required": bool(
+                    self.rotation_required
+                ),
+                "selected_refinement_mode": (
+                    self.selected_refinement_mode
+                ),
+                "rigid_candidate_dx_um": float(
+                    self.rigid_candidate_dx_um
+                ),
+                "rigid_candidate_dy_um": float(
+                    self.rigid_candidate_dy_um
+                ),
+                "rigid_candidate_rotation_deg": float(
+                    self.rigid_candidate_rot_deg
+                ),
+                "translation_candidate_dx_um": float(
+                    self.translation_candidate_dx_um
+                ),
+                "translation_candidate_dy_um": float(
+                    self.translation_candidate_dy_um
+                ),
+            },
             "direct_search_boundary_flags": (
                 self.direct_boundary
             ),
-            "translation_only_safe": bool(
-                self.translation_only_safe
+            "rigid_refinement_safe": bool(
+                self.rigid_refinement_safe
             ),
             "automatic_correction_enabled": bool(
-                self.auto_apply_safe_translation
+                self.auto_refine
             ),
             "correction_applied": bool(
                 self.correction_applied
+            ),
+            "selected_refinement_mode": (
+                self.selected_refinement_mode
+            ),
+            "rotation_required": bool(
+                self.rotation_required
             ),
             "applied_dx_um": (
                 self.direct_dx_um
@@ -4302,7 +4861,9 @@ class MIRIFAlignmentQC:
                 else 0.0
             ),
             "applied_rotation_deg": (
-                0.0
+                self.direct_rot_deg
+                if self.correction_applied
+                else 0.0
             ),
             "direct_mir_if_after": (
                 self._compact_qc(
@@ -4528,6 +5089,47 @@ class MIRIFAlignmentQC:
 
         if hasattr(
             self,
+            "mir_if_translation_only_qc",
+        ):
+            payload[
+                "direct_translation_only_before"
+            ] = self._compact_qc(
+                self.mir_if_translation_only_qc
+            )
+
+        if hasattr(
+            self,
+            "rotation_required",
+        ):
+            payload[
+                "rotation_necessity"
+            ] = {
+                "rigid_best_score": float(
+                    self.mir_if_direct_qc[
+                        "fine_best"
+                    ]["score"]
+                ),
+                "translation_only_best_score": float(
+                    self.mir_if_translation_only_qc[
+                        "fine_best"
+                    ]["score"]
+                ),
+                "extra_gain_from_rotation": float(
+                    self.rotation_extra_gain
+                ),
+                "min_extra_gain_required": float(
+                    self.rotation_min_extra_gain
+                ),
+                "rotation_required": bool(
+                    self.rotation_required
+                ),
+                "selected_refinement_mode": (
+                    self.selected_refinement_mode
+                ),
+            }
+
+        if hasattr(
+            self,
             "direct_match_trustworthy",
         ):
             payload[
@@ -4558,6 +5160,12 @@ class MIRIFAlignmentQC:
                 "applied": bool(
                     self.correction_applied
                 ),
+                "selected_refinement_mode": (
+                    self.selected_refinement_mode
+                ),
+                "rotation_required": bool(
+                    self.rotation_required
+                ),
                 "dx_um": float(
                     self.direct_dx_um
                     if self.correction_applied
@@ -4568,7 +5176,11 @@ class MIRIFAlignmentQC:
                     if self.correction_applied
                     else 0.0
                 ),
-                "rotation_deg": 0.0,
+                "rotation_deg": float(
+                    self.direct_rot_deg
+                    if self.correction_applied
+                    else 0.0
+                ),
             }
 
         if hasattr(
