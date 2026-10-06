@@ -1005,6 +1005,17 @@ class MIRIFAlignmentQC:
         Number of plaque regions displayed in the final zoom-validation figure.
         Set to 0 to disable plaque zoom panels.
 
+    plaque_zoom_selection : {"largest", "random", "mixed"}, default "largest"
+        Strategy used to choose plaque regions for the final zoom-validation
+        figure. ``largest`` preserves the historical behavior, ``random``
+        draws a seeded random subset, and ``mixed`` shows approximately half
+        largest plaques and half seeded-random plaques from the remainder.
+
+    plaque_zoom_seed : int or None, default 42
+        Random seed used only for plaque-zoom QC selection. The registration
+        and refinement algorithms are deterministic and do not use this seed.
+        Set to None for a different random subset each run.
+
     auto_refine : bool, default True
         If True, apply a small safe rigid correction (translation + rotation) to IF + mask when all gates pass.
         MIR and BF are never moved.
@@ -1086,6 +1097,8 @@ class MIRIFAlignmentQC:
         sample_name: str = "sample",
         plaque_radius_um: float = 40.0,
         plaque_zoom_count: int = 6,
+        plaque_zoom_selection: str = "largest",
+        plaque_zoom_seed: Optional[int] = 42,
         auto_refine: bool = True,
         save_figures: bool = True,
         show_figures: bool = False,
@@ -1131,6 +1144,18 @@ class MIRIFAlignmentQC:
         plaque_zoom_count
             Number of plaque regions to show in the final zoom figure.
             Default 6. Use 0 to disable plaque zooms.
+
+        plaque_zoom_selection
+            Plaque selection strategy for the final zoom figure. Supported
+            values are ``"largest"``, ``"random"``, and ``"mixed"``.
+            ``"largest"`` reproduces the previous behavior. ``"random"``
+            draws all displayed plaques randomly. ``"mixed"`` shows roughly
+            half largest plaques and half random plaques. Default ``"largest"``.
+
+        plaque_zoom_seed
+            Seed for the local NumPy random generator used by random/mixed
+            plaque QC sampling. Default 42. Use None for non-reproducible
+            plaque selection. This seed does not affect registration.
 
         auto_refine
             Apply a small safe IF+mask rigid correction automatically when all
@@ -1199,6 +1224,35 @@ class MIRIFAlignmentQC:
             raise ValueError(
                 "plaque_zoom_count must be >= 0."
             )
+
+        self.plaque_zoom_selection = str(
+            plaque_zoom_selection
+        ).strip().lower()
+
+        valid_plaque_zoom_selections = {
+            "largest",
+            "random",
+            "mixed",
+        }
+
+        if (
+            self.plaque_zoom_selection
+            not in valid_plaque_zoom_selections
+        ):
+            raise ValueError(
+                "plaque_zoom_selection must be one of: "
+                "'largest', 'random', or 'mixed'."
+            )
+
+        self.plaque_zoom_seed = (
+            None
+            if plaque_zoom_seed is None
+            else int(plaque_zoom_seed)
+        )
+
+        # Filled when final plaque QC is generated. Keeping the selection
+        # metadata allows the exact QC sample to be reconstructed later.
+        self.plaque_zoom_qc = None
 
         self.auto_refine = bool(auto_refine)
         self.auto_refine = self.auto_refine
@@ -1489,6 +1543,17 @@ class MIRIFAlignmentQC:
                 "How many final plaque regions to show. Default 6. "
                 "Use 0 to disable plaque zooms."
             ),
+            "plaque_zoom_selection": (
+                "How plaque zooms are chosen: 'largest', 'random', or "
+                "'mixed'. 'largest' preserves historical behavior; "
+                "'mixed' combines largest and random plaques. Default "
+                "'largest'."
+            ),
+            "plaque_zoom_seed": (
+                "Seed used only for random/mixed plaque zoom QC sampling. "
+                "The same integer reproduces the same plaque sample. "
+                "Use None for a new random sample each run. Default 42."
+            ),
             "auto_refine": (
                 "Apply a safe small rigid correction to IF + mask automatically. "
                 "MIR and BF never move. Default True."
@@ -1550,6 +1615,8 @@ class MIRIFAlignmentQC:
         return {
             "plaque_radius_um": self.plaque_radius_um,
             "plaque_zoom_count": self.plaque_zoom_count,
+            "plaque_zoom_selection": self.plaque_zoom_selection,
+            "plaque_zoom_seed": self.plaque_zoom_seed,
             "auto_refine": self.auto_refine,
             "save_figures": self.save_figures,
             "show_figures": self.show_figures,
@@ -4271,19 +4338,52 @@ class MIRIFAlignmentQC:
         self,
     ):
         """
-        Show the largest plaque-mask connected regions.
+        Show selected plaque-mask connected regions for final visual QC.
 
-        The number of displayed plaque regions is controlled by the public
-        plaque_zoom_count constructor parameter. Default: 6.
+        Selection is controlled by ``plaque_zoom_selection``:
+
+        ``largest``
+            Historical behavior. Show the largest connected components.
+
+        ``random``
+            Show a random subset without replacement. ``plaque_zoom_seed``
+            makes the subset exactly reproducible.
+
+        ``mixed``
+            Show approximately half of the largest plaques and fill the
+            remaining rows with a seeded-random sample from the other plaques.
+
+        Random sampling uses a local ``numpy.random.Generator``. Therefore the
+        plaque QC seed does not modify NumPy's global random state and cannot
+        influence the registration/refinement calculations.
         """
         max_regions = self.plaque_zoom_count
 
         if max_regions == 0:
+            self.plaque_zoom_qc = {
+                "selection": self.plaque_zoom_selection,
+                "seed": self.plaque_zoom_seed,
+                "requested_count": 0,
+                "displayed_count": 0,
+                "total_components": None,
+                "selected_regions": [],
+                "status": "disabled_by_plaque_zoom_count",
+            }
             return
+
         if not (
             self.save_figures
             or self.show_figures
         ):
+            self.plaque_zoom_qc = {
+                "selection": self.plaque_zoom_selection,
+                "seed": self.plaque_zoom_seed,
+                "requested_count": int(max_regions),
+                "displayed_count": 0,
+                "total_components": None,
+                "selected_regions": [],
+                "status": "disabled_by_figure_output_settings",
+            }
             return
 
         (
@@ -4294,6 +4394,15 @@ class MIRIFAlignmentQC:
         )
 
         if n_plaque == 0:
+            self.plaque_zoom_qc = {
+                "selection": self.plaque_zoom_selection,
+                "seed": self.plaque_zoom_seed,
+                "requested_count": int(max_regions),
+                "displayed_count": 0,
+                "total_components": 0,
+                "selected_regions": [],
+                "status": "no_plaque_components",
+            }
             return
 
         objects = ndi.find_objects(
@@ -4324,23 +4433,105 @@ class MIRIFAlignmentQC:
             )
 
             regions.append({
-                "label": label_id,
+                "label": int(label_id),
                 "slice": region_slice,
                 "area": area,
             })
 
+        # Keep a stable size ranking as the base ordering. This makes both
+        # 'largest' and seeded random/mixed selection reproducible for the same
+        # final mask. The component label is a deterministic tie-breaker.
         regions = sorted(
             regions,
             key=lambda item: (
-                item["area"]
+                -item["area"],
+                item["label"],
             ),
-            reverse=True,
         )
 
         n_show = min(
             int(max_regions),
             len(regions),
         )
+
+        rng = np.random.default_rng(
+            self.plaque_zoom_seed
+        )
+
+        selected_regions = []
+
+        if self.plaque_zoom_selection == "largest":
+            for region in regions[:n_show]:
+                selected = dict(region)
+                selected["selection_source"] = "largest"
+                selected_regions.append(selected)
+
+        elif self.plaque_zoom_selection == "random":
+            selected_indices = rng.choice(
+                len(regions),
+                size=n_show,
+                replace=False,
+            )
+
+            for index in selected_indices:
+                selected = dict(
+                    regions[int(index)]
+                )
+                selected["selection_source"] = "random"
+                selected_regions.append(selected)
+
+        elif self.plaque_zoom_selection == "mixed":
+            # With an even count this is exactly 50/50. With an odd count the
+            # extra row is assigned to the largest-plaque group.
+            n_largest = min(
+                (n_show + 1) // 2,
+                len(regions),
+            )
+            n_random = n_show - n_largest
+
+            for region in regions[:n_largest]:
+                selected = dict(region)
+                selected["selection_source"] = "largest"
+                selected_regions.append(selected)
+
+            remaining = regions[n_largest:]
+
+            if n_random > 0:
+                random_indices = rng.choice(
+                    len(remaining),
+                    size=n_random,
+                    replace=False,
+                )
+
+                for index in random_indices:
+                    selected = dict(
+                        remaining[int(index)]
+                    )
+                    selected["selection_source"] = "random"
+                    selected_regions.append(selected)
+
+        # Save compact, JSON-serializable provenance before plotting.
+        self.plaque_zoom_qc = {
+            "selection": self.plaque_zoom_selection,
+            "seed": self.plaque_zoom_seed,
+            "requested_count": int(max_regions),
+            "displayed_count": int(len(selected_regions)),
+            "total_components": int(len(regions)),
+            "selected_regions": [
+                {
+                    "figure_row": int(row + 1),
+                    "component_label": int(region["label"]),
+                    "area_pixels": int(region["area"]),
+                    "selection_source": str(
+                        region["selection_source"]
+                    ),
+                }
+                for row, region in enumerate(
+                    selected_regions
+                )
+            ],
+            "status": "generated",
+        }
 
         mir_spacing_x_um = (
             float(
@@ -4401,7 +4592,7 @@ class MIRIFAlignmentQC:
             row,
             region,
         ) in enumerate(
-            regions[:n_show]
+            selected_regions
         ):
             region_slice = region[
                 "slice"
@@ -4498,6 +4689,12 @@ class MIRIFAlignmentQC:
             area = region[
                 "area"
             ]
+            component_label = region[
+                "label"
+            ]
+            selection_source = region[
+                "selection_source"
+            ]
 
             ax = axes[
                 row,
@@ -4519,8 +4716,10 @@ class MIRIFAlignmentQC:
             )
 
             ax.set_title(
-                f"Plaque {row + 1}: MIR crop\n"
-                f"area={area} px"
+                f"Plaque QC {row + 1}: MIR crop\n"
+                f"component={component_label}, "
+                f"area={area} px, "
+                f"source={selection_source}"
             )
 
             ax.axis("off")
@@ -4545,7 +4744,7 @@ class MIRIFAlignmentQC:
             )
 
             ax.set_title(
-                f"Plaque {row + 1}: IF crop"
+                f"Plaque QC {row + 1}: IF crop"
             )
 
             ax.axis("off")
@@ -4576,7 +4775,7 @@ class MIRIFAlignmentQC:
             )
 
             ax.set_title(
-                f"Plaque {row + 1}: "
+                f"Plaque QC {row + 1}: "
                 "MIR + IF + mask"
             )
 
@@ -4885,6 +5084,7 @@ class MIRIFAlignmentQC:
             "plaque_positive_mir_pixels": int(
                 self.plaque_positive_mir_pixels
             ),
+            "plaque_zoom_qc": self.plaque_zoom_qc,
             "outputs": {
                 "if_refined": (
                     str(
@@ -5258,6 +5458,14 @@ class MIRIFAlignmentQC:
                 self.plaque_positive_mir_pixels
             )
 
+        if (
+            hasattr(self, "plaque_zoom_qc")
+            and self.plaque_zoom_qc is not None
+        ):
+            payload["plaque_zoom_qc"] = (
+                self.plaque_zoom_qc
+            )
+
         self.summary_json_path.write_text(
             json.dumps(
                 payload,
@@ -5265,4 +5473,3 @@ class MIRIFAlignmentQC:
             ),
             encoding="utf-8",
         )
-
